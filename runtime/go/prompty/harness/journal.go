@@ -476,7 +476,9 @@ func decodeJournalLine(text string) (JournalRecord, error) {
 		if !ok {
 			return JournalRecord{}, fmt.Errorf("turn record has no event object")
 		}
-		event, err := model.LoadTurnEvent(payload, model.NewLoadContext())
+		event, err := loadJournalValue("turn event", func() (model.TurnEvent, error) {
+			return model.LoadTurnEvent(payload, model.NewLoadContext())
+		})
 		if err != nil {
 			return JournalRecord{}, fmt.Errorf("decode turn event: %w", err)
 		}
@@ -486,7 +488,9 @@ func decodeJournalLine(text string) (JournalRecord, error) {
 		if !ok {
 			return JournalRecord{}, fmt.Errorf("session record has no event object")
 		}
-		event, err := model.LoadSessionEvent(payload, model.NewLoadContext())
+		event, err := loadJournalValue("session event", func() (model.SessionEvent, error) {
+			return model.LoadSessionEvent(payload, model.NewLoadContext())
+		})
 		if err != nil {
 			return JournalRecord{}, fmt.Errorf("decode session event: %w", err)
 		}
@@ -496,7 +500,9 @@ func decodeJournalLine(text string) (JournalRecord, error) {
 		if !ok {
 			return JournalRecord{}, fmt.Errorf("summary record has no summary object")
 		}
-		summary, err := model.LoadSessionSummary(payload, model.NewLoadContext())
+		summary, err := loadJournalValue("session summary", func() (model.SessionSummary, error) {
+			return model.LoadSessionSummary(payload, model.NewLoadContext())
+		})
 		if err != nil {
 			return JournalRecord{}, fmt.Errorf("decode session summary: %w", err)
 		}
@@ -505,4 +511,13 @@ func decodeJournalLine(text string) (JournalRecord, error) {
 		return JournalRecord{}, fmt.Errorf("unknown journal record kind %q", kind)
 	}
 	return record, nil
+}
+
+func loadJournalValue[T any](label string, load func() (T, error)) (value T, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("invalid %s shape: %v", label, recovered)
+		}
+	}()
+	return load()
 }

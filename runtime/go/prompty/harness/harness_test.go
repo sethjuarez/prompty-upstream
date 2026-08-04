@@ -143,6 +143,38 @@ func TestJournalReportsCorruptRecordAndKeepsReading(t *testing.T) {
 	}
 }
 
+func TestJournalReportsTypeMismatchAndKeepsReading(t *testing.T) {
+	cases := []struct {
+		name      string
+		malformed string
+		label     string
+	}{
+		{"turn", `{"kind":"turn","event":{"id":123,"type":"turn_start","timestamp":"t"}}`, "invalid turn event shape"},
+		{"session", `{"kind":"session","event":{"id":123,"type":"session_start","timestamp":"t"}}`, "invalid session event shape"},
+		{"summary", `{"kind":"summary","summary":{"sessionId":123}}`, "invalid session summary shape"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			content := strings.Join([]string{
+				tc.malformed,
+				`{"kind":"turn","event":{"id":"valid","type":"turn_end","timestamp":"t","turnId":"u","iteration":1,"payload":{"status":"success"}}}`,
+				``,
+			}, "\n")
+
+			records, defects, err := harness.ReadJournalFrom(strings.NewReader(content))
+			if err != nil {
+				t.Fatalf("ReadJournalFrom: %v", err)
+			}
+			if len(records) != 1 || records[0].Turn == nil || records[0].Turn.Id != "valid" {
+				t.Fatalf("records = %#v, want the valid record after the defect", records)
+			}
+			if len(defects) != 1 || defects[0].Line != 1 || !strings.Contains(defects[0].Err.Error(), tc.label) {
+				t.Fatalf("defects = %#v, want %q on line 1", defects, tc.label)
+			}
+		})
+	}
+}
+
 func TestJournalRejectsUnknownRecordKind(t *testing.T) {
 	// An unknown kind is not silently dropped: it means the writer and the
 	// reader disagree about the format, which a caller must be told about.
