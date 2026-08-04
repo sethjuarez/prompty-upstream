@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
 	"time"
 
 	model "prompty/model"
@@ -34,6 +35,9 @@ type Executor struct {
 	Env Env
 	// Client performs requests. Nil uses a shared client with DefaultTimeout.
 	Client *http.Client
+	// TokenProvider acquires a Foundry bearer token when the connection and
+	// environment do not contain one. Nil uses DefaultAzureCredential.
+	TokenProvider TokenProvider
 	// MaxResponseBytes bounds buffered non-streaming responses. Zero uses
 	// wire.DefaultMaxResponseBytes.
 	MaxResponseBytes int64
@@ -78,7 +82,7 @@ func (e *Executor) ExecuteStream(agent model.Prompty, messages []model.Message) 
 
 // ExecuteContext performs one non-streaming provider call.
 func (e *Executor) ExecuteContext(ctx context.Context, agent model.Prompty, messages []model.Message) (interface{}, error) {
-	request, err := BuildProviderRequest(agent, messages, e.Dialect, e.Env, false)
+	request, err := e.buildRequestContext(ctx, agent, messages, false)
 	if err != nil {
 		return nil, err
 	}
@@ -108,7 +112,7 @@ func (e *Executor) ExecuteContext(ctx context.Context, agent model.Prompty, mess
 // RawStream. The caller must either consume it through a Processor or close its
 // Body; DecodeStream does the latter automatically.
 func (e *Executor) ExecuteStreamContext(ctx context.Context, agent model.Prompty, messages []model.Message) (interface{}, error) {
-	request, err := BuildProviderRequest(agent, messages, e.Dialect, e.Env, true)
+	request, err := e.buildRequestContext(ctx, agent, messages, true)
 	if err != nil {
 		return nil, err
 	}
@@ -124,6 +128,53 @@ func (e *Executor) ExecuteStreamContext(ctx context.Context, agent model.Prompty
 	}
 
 	return RawStream{APIType: wire.APIType(agent), Body: response.Body}, nil
+}
+
+func (e *Executor) buildRequestContext(
+	ctx context.Context,
+	agent model.Prompty,
+	messages []model.Message,
+	stream bool,
+) (Request, error) {
+	env := e.Env
+	conn := wire.ConnectionMap(agent)
+	if ResolveDialect(e.Dialect, conn) == DialectFoundry && foundryToken(conn, env) == "" {
+		provider := e.TokenProvider
+		var err error
+		if provider == nil {
+			provider, err = ambientFoundryTokenProvider()
+			if err != nil {
+				return Request{}, wire.NewProviderError(
+					"foundry", "create DefaultAzureCredential", 0, "", wire.RedactSecrets(err.Error()), nil)
+			}
+		}
+		token, err := provider.Token(ctx)
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return Request{}, ctxErr
+			}
+			return Request{}, wire.NewProviderError(
+				"foundry", "acquire Entra ID token", 0, "", wire.RedactSecrets(err.Error()), nil)
+		}
+		if token == "" {
+			return Request{}, wire.NewProviderError(
+				"foundry", "acquire Entra ID token", 0, "", "credential returned an empty token", nil)
+		}
+		env = withEnvironmentValue(env, EnvInferenceCredential, token)
+	}
+	return BuildProviderRequest(agent, messages, e.Dialect, env, stream)
+}
+
+func withEnvironmentValue(base Env, key, value string) Env {
+	return func(candidate string) (string, bool) {
+		if candidate == key {
+			return value, true
+		}
+		if base == nil {
+			return os.LookupEnv(candidate)
+		}
+		return base(candidate)
+	}
 }
 
 func (e *Executor) send(ctx context.Context, client *http.Client, request Request) (*http.Response, error) {

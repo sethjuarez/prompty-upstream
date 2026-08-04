@@ -364,10 +364,7 @@ func authHeader(conn map[string]interface{}, dialect Dialect, env Env) (string, 
 		// not a fallback here: an Azure OpenAI key is not a bearer token, and
 		// sending it as one turns a misconfiguration into a confusing 401
 		// instead of the clear error below.
-		token := wire.ConnectionString(conn, "token", "accessToken", "access_token", "apiKey", "api_key")
-		if token == "" {
-			token = env.lookup(EnvInferenceCredential)
-		}
+		token := foundryToken(conn, env)
 		if token == "" {
 			return "", "", missingCredentialError("foundry", EnvInferenceCredential)
 		}
@@ -395,6 +392,14 @@ func authHeader(conn map[string]interface{}, dialect Dialect, env Env) (string, 
 		}
 		return "Authorization", "Bearer " + key, nil
 	}
+}
+
+func foundryToken(conn map[string]interface{}, env Env) string {
+	token := wire.ConnectionString(conn, "token", "accessToken", "access_token", "apiKey", "api_key")
+	if token == "" {
+		token = env.lookup(EnvInferenceCredential)
+	}
+	return token
 }
 
 func missingCredentialError(dialect, envVar string) error {
