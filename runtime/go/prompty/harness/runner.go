@@ -15,21 +15,13 @@ import (
 // turn and session events to a sink and a journal, and checkpoints after every
 // model response.
 //
-// # Why this is not the emitted ReferenceTurnRunner
+// # Relationship to the model ReferenceTurnRunner
 //
-// prompty/model carries a generated ReferenceTurnRunner with the same shape.
-// It is regenerated wholesale and is not edited, and it has a defect this
-// runner exists to fix: when a permission request is denied it returns the
-// synthetic model.HostToolResult to the model but never records a tool_result
-// turn event. The refusal is therefore invisible in the journal, so a replay
-// cannot tell "the tool was denied" from "the tool was never requested" — and
-// a denial is precisely the step an audit of a durable session most needs to
-// see. The shared vector spec/vectors/harness/replay_vectors.json requires
-// `turn:tool_result:0:add:false:permission_denied`, which the emitted runner
-// does not produce.
-//
-// Behaviour is otherwise deliberately identical, so a host can swap between
-// them and compare journals.
+// prompty/model carries the minimal contract-level ReferenceTurnRunner. This
+// package provides the host-facing implementation with context cancellation,
+// collaborator validation, guaranteed journal closure, hardened error paths,
+// and crash-tolerant replay support. Both implementations intentionally emit
+// the same shared replay-vector sequence so their journals can be compared.
 //
 // # Event order
 //

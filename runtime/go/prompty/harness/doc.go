@@ -12,11 +12,10 @@
 // interfaces. The generated contract is the cross-runtime one; this package
 // supplies the Go implementations behind it and never redefines a wire shape.
 //
-// The generated tree also carries reference implementations. Those are the
-// emitter's own, are regenerated wholesale, and are not edited here. Where one
-// is behaviourally incomplete this package reimplements it rather than patching
-// generated code — see TurnRunner, which fixes a journal-visibility defect the
-// emitted ReferenceTurnRunner has (documented on the type).
+// The model tree also carries minimal reference implementations. This package
+// supplies host-facing variants with cancellation, validation, hardened error
+// handling, guaranteed journal closure, and crash-tolerant replay while keeping
+// the same emitted boundary types and event sequence.
 //
 // # A durable turn
 //

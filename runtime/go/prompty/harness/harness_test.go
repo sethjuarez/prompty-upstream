@@ -941,10 +941,9 @@ func TestRunnerGeneratesAPermissionIDWhenTheToolRequestHasNone(t *testing.T) {
 	t.Error("no permission_requested record was journalled")
 }
 
-func TestRunnerRecordsDeniedToolResultTheEmittedReferenceOmits(t *testing.T) {
-	// The regression this runner exists for. The emitted ReferenceTurnRunner
-	// returns the synthetic denial result to the model but never journals a
-	// tool_result event, so a replay cannot tell "denied" from "never asked".
+func TestRunnerRecordsDeniedToolResult(t *testing.T) {
+	// A denial must remain model-visible and replay-visible so a forensic reader
+	// can distinguish "denied" from "never asked".
 	journal := &harness.MemoryJournalWriter{}
 	runner := &harness.TurnRunner{
 		EventSink:          &harness.CollectingEventSink{},
