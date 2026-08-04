@@ -44,19 +44,21 @@ type turnVector struct {
 	} `json:"expected"`
 }
 
-// unsupportedTurnVectors names the engine cases outside this slice.
-var unsupportedTurnVectors = map[string]string{
-	"delegated_provider_state": "delegated provider state, snapshots and checkpoint portability are the emitted ReferenceTurnRunner's protocol, not the practical provider/tool pipeline",
-}
+// unsupportedTurnVectors names the engine cases the practical loop cannot
+// express. It is currently empty: the durable concerns the vectors also pin —
+// snapshots, checkpoints, context portability and the engine event kinds —
+// belong to prompty/engine and are asserted in full by its own vector test.
+var unsupportedTurnVectors = map[string]string{}
 
-// TestTurnVectors drives the feasible subset of the shared engine turn vectors
-// through the practical turn loop.
+// TestTurnVectors drives the shared engine turn vectors through the practical
+// turn loop.
 //
 // The vectors also pin snapshot counts, checkpoint creation, commit portability
-// and the low-level engine event kinds. Those belong to the emitted
-// ReferenceTurnRunner, which this slice deliberately does not duplicate, so
-// only the observable turn outcome is asserted here: status, output, iteration
-// count, and the number and order of tool results.
+// and the low-level engine event kinds. Those are the durable engine's
+// contract, asserted in full by prompty/engine's own vector test; the practical
+// loop deliberately has no such concepts, so only the observable turn outcome
+// is asserted here: status, output, iteration count, and the number and order
+// of tool results.
 func TestTurnVectors(t *testing.T) {
 	var file turnVectorFile
 	readVectorFile(t, "engine/turn_vectors.json", &file)

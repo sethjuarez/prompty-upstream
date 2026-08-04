@@ -31,8 +31,14 @@ type agentVector struct {
 		Cancel *struct {
 			CancelledAt string `json:"cancelled_at"`
 		} `json:"cancel"`
-		Steering      interface{} `json:"steering"`
-		ContextBudget *int        `json:"context_budget"`
+		Steering *struct {
+			Messages []struct {
+				InjectBeforeIteration int    `json:"inject_before_iteration"`
+				Role                  string `json:"role"`
+				Text                  string `json:"text"`
+			} `json:"messages"`
+		} `json:"steering"`
+		ContextBudget *int `json:"context_budget"`
 	} `json:"input"`
 	Sequence []struct {
 		Turn                 int                    `json:"turn"`
@@ -43,6 +49,7 @@ type agentVector struct {
 	Expected struct {
 		Result             interface{}   `json:"result"`
 		Error              string        `json:"error"`
+		ErrorReason        string        `json:"error_reason"`
 		Iterations         *int          `json:"iterations"`
 		TotalMessages      *int          `json:"total_messages"`
 		MessageSequence    []interface{} `json:"message_sequence"`
@@ -67,18 +74,13 @@ type toolResultSpec struct {
 	Result     string `json:"result"`
 }
 
-// unsupportedAgentVectors names the cases this slice deliberately does not
+// unsupportedAgentVectors names the cases this runtime deliberately does not
 // implement, each with the reason it is out of scope. They are skipped loudly
 // rather than filtered silently so the coverage gap stays visible.
-var unsupportedAgentVectors = map[string]string{
-	"context_trim_basic":                "context compaction is an engine/host concern; this slice implements provider and tool dispatch only",
-	"context_no_trim_when_fits":         "context compaction is an engine/host concern; this slice implements provider and tool dispatch only",
-	"context_preserves_system_messages": "context compaction is an engine/host concern; this slice implements provider and tool dispatch only",
-	"guardrail_input_deny":              "input guardrails are a host policy hook; the turn loop implements the tool permission hook only",
-	"guardrail_output_deny":             "output guardrails are a host policy hook; the turn loop implements the tool permission hook only",
-	"steering_inject_message":           "mid-turn steering injection is a host concern outside the provider/tool slice",
-	"steering_multiple_messages":        "mid-turn steering injection is a host concern outside the provider/tool slice",
-}
+//
+// It is currently empty: context trimming, guardrails and steering are now
+// implemented as optional policies around the turn loop.
+var unsupportedAgentVectors = map[string]string{}
 
 // TestAgentVectors drives the shared agent vectors through the real turn loop,
 // the real OpenAI processor and the real OpenAI message formatter. Only the
@@ -162,6 +164,8 @@ func runAgentVector(t *testing.T, vector agentVector) {
 		Processor: openai.NewProcessor(),
 	}
 	applyGuardrails(&options, vector)
+	applySteering(&options, vector)
+	applyContextBudget(&options, vector)
 	events := captureEvents(&options)
 	applyCancellation(&options, executor, vector, cancel, ctx)
 
@@ -254,21 +258,74 @@ func messagesForVector(vector agentVector) []model.Message {
 	return messages
 }
 
+// applyGuardrails wires the vector's guardrail configuration onto the real
+// RunOptions.Guardrails hooks, so the loop's own policy path is exercised
+// rather than a test-only approximation of it.
 func applyGuardrails(options *prompty.RunOptions, vector agentVector) {
-	guardrails := vector.Input.Guardrails
-	if guardrails == nil || guardrails.Tool == nil {
+	spec := vector.Input.Guardrails
+	if spec == nil {
 		return
 	}
-	denied := map[string]bool{}
-	for _, name := range guardrails.Tool.DenyTools {
-		denied[name] = true
-	}
-	reason := guardrails.Tool.Reason
-	options.Permit = func(_ context.Context, call model.ToolCall, _ map[string]interface{}) prompty.PermissionDecision {
-		if denied[call.Name] {
-			return prompty.Deny(reason)
+
+	guardrails := &prompty.Guardrails{}
+
+	if spec.Input != nil {
+		rule := *spec.Input
+		guardrails.Input = func(context.Context, []model.Message, model.Prompty) prompty.GuardrailResult {
+			if rule.Action == "deny" {
+				return prompty.DenyGuardrail(rule.Reason)
+			}
+			return prompty.AllowGuardrail()
 		}
-		return prompty.Allow()
+	}
+	if spec.Output != nil {
+		rule := *spec.Output
+		guardrails.Output = func(context.Context, interface{}, model.Prompty) prompty.GuardrailResult {
+			if rule.Action == "deny" {
+				return prompty.DenyGuardrail(rule.Reason)
+			}
+			return prompty.AllowGuardrail()
+		}
+	}
+	if spec.Tool != nil {
+		denied := map[string]bool{}
+		for _, name := range spec.Tool.DenyTools {
+			denied[name] = true
+		}
+		reason := spec.Tool.Reason
+		guardrails.Tool = func(_ context.Context, name string, _ map[string]interface{}, _ model.Prompty) prompty.GuardrailResult {
+			if denied[name] {
+				return prompty.DenyGuardrail(reason)
+			}
+			return prompty.AllowGuardrail()
+		}
+	}
+
+	options.Guardrails = guardrails
+}
+
+// applySteering pre-loads the vector's steering queue.
+//
+// Every steering vector injects before iteration 2, which is exactly when the
+// loop drains: steering is never drained before the first model call, because
+// a message queued before the turn started is already part of the prompt the
+// caller built.
+func applySteering(options *prompty.RunOptions, vector agentVector) {
+	spec := vector.Input.Steering
+	if spec == nil || len(spec.Messages) == 0 {
+		return
+	}
+	queue := prompty.NewSteering()
+	for _, message := range spec.Messages {
+		queue.Send(message.Text)
+	}
+	options.Steering = queue
+}
+
+// applyContextBudget wires the vector's character budget onto the loop.
+func applyContextBudget(options *prompty.RunOptions, vector agentVector) {
+	if vector.Input.ContextBudget != nil {
+		options.ContextBudget = *vector.Input.ContextBudget
 	}
 }
 
@@ -342,6 +399,20 @@ func assertVectorOutcome(t *testing.T, vector agentVector, result prompty.RunRes
 	case expected.Error == "CancelledError":
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("expected cancellation, got err=%v result=%#v", err, result.Output)
+		}
+	case expected.Error == "GuardrailError":
+		// The vector names the error *type* here and carries the message
+		// separately in error_reason, unlike the vectors whose `error` field
+		// is the message itself.
+		var guardrailErr *prompty.GuardrailError
+		if !errors.As(err, &guardrailErr) {
+			t.Fatalf("expected a *prompty.GuardrailError, got err=%v result=%#v", err, result.Output)
+		}
+		if !errors.Is(err, prompty.ErrGuardrailDenied) {
+			t.Error("a guardrail error must unwrap to prompty.ErrGuardrailDenied")
+		}
+		if expected.ErrorReason != "" && guardrailErr.Reason != expected.ErrorReason {
+			t.Errorf("guardrail reason = %q, want %q", guardrailErr.Reason, expected.ErrorReason)
 		}
 	case expected.Error != "":
 		if err == nil {

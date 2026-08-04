@@ -66,6 +66,23 @@ type RunOptions struct {
 	// together or neither; leaving them nil resolves from the agent's provider.
 	Executor  Executor
 	Processor Processor
+
+	// ContextBudget trims the conversation to a character budget before each
+	// model call (spec §13.3). Zero or negative disables trimming, which is the
+	// default: a host that has not measured its budget is better served by the
+	// provider's own error than by silently dropping history.
+	ContextBudget int
+	// Compaction replaces the mechanical summary of trimmed messages with a
+	// better one. It is only consulted when ContextBudget actually dropped
+	// something, and a failure leaves the mechanical summary in place.
+	Compaction CompactionFunc
+	// Guardrails are optional host policy hooks (spec §13.4). A nil Guardrails,
+	// or any nil field within it, allows everything.
+	Guardrails *Guardrails
+	// Steering is an optional queue of messages to inject between iterations
+	// (spec §13.5). It is drained before every model call after the first, so
+	// steering sent during iteration N is seen by iteration N+1.
+	Steering *Steering
 }
 
 func (o RunOptions) maxIterations() int {
@@ -92,6 +109,12 @@ type RunResult struct {
 	Iterations int
 	// Dispatches records every tool call in execution order.
 	Dispatches []ToolDispatch
+	// ContextDropped counts messages removed by context trimming across the
+	// whole turn. It is reported rather than swallowed so a host can tell a
+	// short answer caused by lost history from a short answer the model meant.
+	ContextDropped int
+	// SteeringInjected counts messages injected between iterations.
+	SteeringInjected int
 }
 
 // Text renders the output as a string when it is one, else "".
@@ -154,6 +177,45 @@ func RunMessages(ctx context.Context, agent model.Prompty, messages []model.Mess
 			return result, err
 		}
 
+		// Steering is drained between iterations, never before the first model
+		// call. A queue filled before the turn started is not skipped — it is
+		// injected at the next iteration boundary, which is what the shared
+		// steering vectors describe (inject_before_iteration: 2). Anything the
+		// caller wants in the opening prompt belongs in the prompt, because
+		// the first model call has already been built by the time the loop
+		// runs.
+		if iteration > 1 {
+			if injected := options.Steering.Drain(); len(injected) > 0 {
+				result.Messages = append(result.Messages, injected...)
+				result.SteeringInjected += len(injected)
+				options.emit(Event{Type: EventStatus, Data: map[string]interface{}{
+					"message": "Injecting steering message",
+					"count":   len(injected),
+				}})
+				options.emit(Event{Type: EventMessagesUpdate, Data: map[string]interface{}{
+					"message_count": len(result.Messages),
+				}})
+			}
+		}
+
+		// Trimming runs after steering so the freshly injected instruction is
+		// weighed against the budget like any other message, and before the
+		// input guardrail so the guardrail sees exactly what the provider will.
+		if options.ContextBudget > 0 {
+			trimmed, dropped := applyContextPolicy(ctx, result.Messages, options.ContextBudget, options.Compaction)
+			result.Messages = trimmed
+			result.ContextDropped += dropped
+		}
+
+		if verdict := options.Guardrails.CheckInput(ctx, result.Messages, agent); !verdict.Allowed {
+			err := &GuardrailError{
+				Reason: guardrailReason(verdict, "Input denied"),
+				Phase:  GuardrailPhaseInput,
+			}
+			options.emit(Event{Type: EventError, Data: map[string]interface{}{"message": err.Error()}})
+			return result, err
+		}
+
 		raw, err := executeWith(ctx, executor, agent, result.Messages)
 		if err != nil {
 			options.emit(Event{Type: EventError, Data: map[string]interface{}{"message": err.Error()}})
@@ -169,6 +231,23 @@ func RunMessages(ctx context.Context, agent model.Prompty, messages []model.Mess
 
 		toolCalls, hasToolCalls := AsToolCalls(processed)
 		if !hasToolCalls {
+			// The output guardrail runs only on a final answer. An
+			// intermediate tool-calling round is not something the host
+			// promised to review, and checking it would fire the policy on
+			// text the user will never see.
+			verdict := options.Guardrails.CheckOutput(ctx, processed, agent)
+			if !verdict.Allowed {
+				err := &GuardrailError{
+					Reason: guardrailReason(verdict, "Output denied"),
+					Phase:  GuardrailPhaseOutput,
+				}
+				options.emit(Event{Type: EventError, Data: map[string]interface{}{"message": err.Error()}})
+				return result, err
+			}
+			if verdict.Rewrite != nil {
+				processed = *verdict.Rewrite
+			}
+
 			result.Output = processed
 			// The model's own answer belongs in the conversation the caller
 			// gets back: a host that appends the next user turn and calls
@@ -186,7 +265,7 @@ func RunMessages(ctx context.Context, agent model.Prompty, messages []model.Mess
 			options.emit(Event{Type: EventStatus, Data: map[string]interface{}{"message": "Starting agent loop"}})
 		}
 
-		dispatches, err := dispatchAll(ctx, options, bindings, toolCalls)
+		dispatches, err := dispatchAll(ctx, agent, options, bindings, toolCalls)
 		result.Dispatches = append(result.Dispatches, dispatches...)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -222,6 +301,7 @@ func RunMessages(ctx context.Context, agent model.Prompty, messages []model.Mess
 // dispatchAll runs a round of tool calls in request order.
 func dispatchAll(
 	ctx context.Context,
+	agent model.Prompty,
 	options RunOptions,
 	bindings map[string]map[string]interface{},
 	calls []model.ToolCall,
@@ -232,6 +312,11 @@ func dispatchAll(
 		// tool is not registered — without a special case at every call site.
 		registry = NewToolRegistry()
 	}
+
+	// A tool guardrail and the host's Permit are folded into one decision so
+	// the dispatcher has a single refusal path, and a denial from either
+	// produces the same model-visible tool result.
+	permit := guardrailPermission(options.Guardrails, agent, options.Permit)
 
 	out := make([]ToolDispatch, 0, len(calls))
 	for _, call := range calls {
@@ -245,7 +330,7 @@ func dispatchAll(
 			"arguments": call.Arguments,
 		}})
 
-		dispatch, err := registry.Dispatch(ctx, call, bindings[call.Name], options.Permit)
+		dispatch, err := registry.Dispatch(ctx, call, bindings[call.Name], permit)
 		if err != nil {
 			return out, err
 		}

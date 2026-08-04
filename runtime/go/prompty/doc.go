@@ -56,16 +56,139 @@
 // ClearCache resets every registry to its built-in defaults — host-registered
 // providers must be registered again afterwards.
 //
+// # A complete turn
+//
+// Load an agent, prepare its conversation, then run the turn loop. Run is the
+// host-facing surface: it drives model calls and tool rounds until the model
+// answers, or until MaxIterations stops it.
+//
+//	openai.Register()
+//
+//	agent, err := prompty.Load("agents/weather.prompty")
+//	if err != nil {
+//		return err
+//	}
+//
+//	tools := prompty.NewToolRegistry()
+//	tools.RegisterText("get_weather", func(ctx context.Context, args map[string]interface{}) (string, error) {
+//		return lookupWeather(ctx, args["city"].(string))
+//	})
+//
+//	result, err := prompty.Run(ctx, agent, map[string]interface{}{"city": "Paris"}, prompty.RunOptions{
+//		Tools: tools,
+//		Permit: func(_ context.Context, call model.ToolCall, _ map[string]interface{}) prompty.PermissionDecision {
+//			if call.Name == "delete_everything" {
+//				return prompty.Deny("that tool is not available in this session")
+//			}
+//			return prompty.Allow()
+//		},
+//		OnEvent: func(event prompty.Event) { log.Printf("%s %v", event.Type, event.Data) },
+//	})
+//	if err != nil {
+//		return err
+//	}
+//	fmt.Println(result.Text())
+//
+// A host that maintains its own history — a chat session, a resumed thread —
+// calls PrepareWithContext once and RunMessages for each turn, so the prompt is
+// not re-rendered on every exchange.
+//
+// StreamRun performs a single model call and yields processed chunks as they
+// arrive, for a UI that renders tokens rather than waiting for the answer.
+//
+//	stream, err := prompty.StreamRun(ctx, agent, inputs)
+//	if err != nil {
+//		return err
+//	}
+//	for chunk := range stream.Chunks() {
+//		render(chunk)
+//	}
+//	return stream.Err()
+//
+// # Optional turn policies
+//
+// Three host policies wrap the loop. All are opt-in, and leaving them unset
+// changes nothing about how a turn runs.
+//
+//   - ContextBudget trims the conversation to a character budget before each
+//     model call, dropping the oldest non-system messages and inserting a
+//     summary in their place (§13.3). Compaction replaces that mechanical
+//     summary with a model- or host-generated one.
+//
+//   - Guardrails check the conversation before each model call, the final
+//     answer before it is returned, and each tool before it runs (§13.4). An
+//     input or output denial fails the turn with a *GuardrailError; a tool
+//     denial becomes a model-visible refusal, so the model can adapt.
+//
+//   - Steering is a queue a host fills from another goroutine while the turn is
+//     running (§13.5). It is drained between iterations and injected as user
+//     messages, which is how a user redirects an agent mid-turn without
+//     cancelling it.
+//
+//     steering := prompty.NewSteering()
+//     go func() { steering.Send("actually, in Celsius") }()
+//
+//     result, err := prompty.Run(ctx, agent, inputs, prompty.RunOptions{
+//     Tools:         tools,
+//     ContextBudget: 50_000,
+//     Steering:      steering,
+//     Guardrails: &prompty.Guardrails{
+//     Input: func(_ context.Context, messages []model.Message, _ model.Prompty) prompty.GuardrailResult {
+//     if containsSecrets(messages) {
+//     return prompty.DenyGuardrail("the prompt contains credentials")
+//     }
+//     return prompty.AllowGuardrail()
+//     },
+//     },
+//     })
+//
+// # Model discovery
+//
+// Discovery reports which models a provider connection exposes. Listing is
+// behind a registered ModelLister, so a host that never discovers models never
+// links a discovery client, and a test registers a fake instead of a network.
+//
+//	openai.RegisterModelLister(openai.ModelLister{Fetch: fetchOpenAIModels})
+//
+//	models, err := prompty.ListModels("openai", connection)
+//
+// Results are enriched from a shared, provider-keyed capability dataset vendored
+// from spec/data/model_capabilities.json under one cross-runtime rule:
+// provider-supplied fields always win, and dataset entries only fill fields the
+// provider left empty, matched by longest id prefix at token boundaries. That is
+// how an OpenAI listing — which returns nothing but ids — comes back with the
+// same context windows and modalities as an Anthropic one.
+//
+// # Durability and the engine
+//
+// Run answers a question. Two sibling packages answer the harder ones.
+//
+//   - prompty/harness is the durable session harness: typed turn and session
+//     events, a newline-delimited JSON replay journal, checkpoints, permission
+//     resolvers and host tool execution. Use it when a session must be
+//     observed, persisted, resumed or replayed.
+//   - prompty/engine is the provider-neutral turn engine: an ordered
+//     model.EngineEvent per decision, a model.EngineCheckpoint per round, a
+//     model.ModelInvocationContextSnapshot per model call, and a
+//     model.TurnCommit at the end. Use it when a turn must survive the process
+//     that started it, or when the provider holds delegated state the host has
+//     to reattach to.
+//
+// Both reuse this package rather than reimplementing it: the engine's
+// ProviderModelPort drives the same Executor and Processor contracts, and its
+// RegistryToolPort dispatches through the same ToolRegistry.
+//
 // # Package layout
 //
 // The dependency graph is acyclic and deliberately one-directional:
 //
 //	prompty/model  <- prompty/wire  <- prompty  <- prompty/openai, prompty/anthropic
+//	                                          \-- prompty/harness, prompty/engine
 //
 // prompty/wire holds the provider-neutral primitives (JSON Schema projection,
 // option dialects, SSE decoding, diagnostic redaction) that both this package
-// and the providers need. This package never imports a provider, so a provider
-// may freely import it.
+// and the providers need. This package never imports a provider, a harness or
+// the engine, so all of them may freely import it.
 //
 // # Security posture
 //
