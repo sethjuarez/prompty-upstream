@@ -73,9 +73,7 @@ export function processResponse(agent: Agent, response: unknown): unknown {
 /** Type guard for async iterables (PromptyStream or raw SDK stream). */
 function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
   return (
-    typeof value === "object" &&
-    value !== null &&
-    Symbol.asyncIterator in value
+    typeof value === "object" && value !== null && Symbol.asyncIterator in value
   );
 }
 
@@ -93,14 +91,18 @@ function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
 async function* streamGenerator(
   response: AsyncIterable<unknown>,
 ): AsyncGenerator<string | ToolCall> {
-  const toolCallAcc: Map<number, { id: string; name: string; arguments: string }> = new Map();
+  const toolCallAcc: Map<
+    number,
+    { id: string; name: string; arguments: string }
+  > = new Map();
 
   for await (const chunk of response) {
     const c = chunk as Record<string, unknown>;
     const choices = c.choices as Record<string, unknown>[] | undefined;
     if (!choices || choices.length === 0) continue;
 
-    const delta = (choices[0] as Record<string, unknown>).delta as Record<string, unknown> | undefined;
+    const delta = (choices[0] as Record<string, unknown>).delta as
+      Record<string, unknown> | undefined;
     if (!delta) continue;
 
     // Content
@@ -180,7 +182,10 @@ function processResponsesApi(
     // Structured output — JSON parse when outputs schema exists
     if (agent.outputs && agent.outputs.length > 0) {
       try {
-        return createStructuredResult(JSON.parse(outputText) as Record<string, unknown>, outputText);
+        return createStructuredResult(
+          JSON.parse(outputText) as Record<string, unknown>,
+          outputText,
+        );
       } catch {
         return outputText;
       }
@@ -207,7 +212,10 @@ function processResponsesApi(
     const text = texts.join("");
     if (agent.outputs && agent.outputs.length > 0) {
       try {
-        return createStructuredResult(JSON.parse(text) as Record<string, unknown>, text);
+        return createStructuredResult(
+          JSON.parse(text) as Record<string, unknown>,
+          text,
+        );
       } catch {
         return text;
       }
@@ -259,7 +267,10 @@ function processChatCompletion(
   // Structured output — JSON parse when outputs schema exists
   if (agent.outputs && agent.outputs.length > 0) {
     try {
-      return createStructuredResult(JSON.parse(content) as Record<string, unknown>, content);
+      return createStructuredResult(
+        JSON.parse(content) as Record<string, unknown>,
+        content,
+      );
     } catch {
       return content;
     }

@@ -140,7 +140,8 @@ export {
 // Tracing
 // ---------------------------------------------------------------------------
 
-export { Tracer,
+export {
+  Tracer,
   trace,
   traceMethod,
   traceSpan,

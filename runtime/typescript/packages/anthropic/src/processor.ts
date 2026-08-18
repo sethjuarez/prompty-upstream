@@ -19,7 +19,10 @@ import { createStructuredResult } from "@prompty/core";
 export class AnthropicProcessor implements Processor {
   async process(agent: Agent, response: unknown): Promise<unknown> {
     return traceSpan("AnthropicProcessor", async (emit) => {
-      emit("signature", "prompty.anthropic.processor.AnthropicProcessor.invoke");
+      emit(
+        "signature",
+        "prompty.anthropic.processor.AnthropicProcessor.invoke",
+      );
       emit("inputs", { data: response });
       const result = processResponse(agent, response);
       // Don't emit result for streaming — it's a generator, not a value
@@ -59,9 +62,7 @@ export function processResponse(agent: Agent, response: unknown): unknown {
 /** Type guard for async iterables (PromptyStream or raw SDK stream). */
 function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
   return (
-    typeof value === "object" &&
-    value !== null &&
-    Symbol.asyncIterator in value
+    typeof value === "object" && value !== null && Symbol.asyncIterator in value
   );
 }
 
@@ -180,7 +181,10 @@ function processMessages(
   // Structured output — JSON parse when outputs schema exists
   if (agent.outputs && agent.outputs.length > 0) {
     try {
-      return createStructuredResult(JSON.parse(text) as Record<string, unknown>, text);
+      return createStructuredResult(
+        JSON.parse(text) as Record<string, unknown>,
+        text,
+      );
     } catch {
       return text;
     }
