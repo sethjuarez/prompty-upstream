@@ -1,0 +1,151 @@
+name: schema generated-code reproducibility
+
+# Asserts that the generated code committed under runtime/* is exactly what the
+# pinned @typra/emitter (schema/package.json) plus the repo's formatters produce.
+#
+# Nothing enforced this before. Every runtime workflow is paths-filtered to
+# runtime/<lang>/**, so a commit touching only schema/ — including one that bumps
+# the emitter pin — triggered ZERO CI. That is not hypothetical: 00a040fb (0.4.26)
+# and 38c7a5a0 (0.4.27) both moved the pin with no regeneration and no job. Both
+# happened to be no-ops, but nothing checked, and the ambiguity cost real time to
+# settle because the only way to know was to run the generator.
+#
+# The trigger paths deliberately extend past schema/**. The drift this gate found
+# on its first run did not come from the emitter at all: #465 regenerated
+# runtime/typescript/package-lock.json for a security audit, which moved prettier
+# 3.8.3 -> 3.9.6, and 3.9.6 formats short union type aliases differently. The
+# generated code was formatted by 3.8.3 and no existing job could see the
+# difference (packages/core's `lint` is `tsc --noEmit`, not a format check). If
+# this gate only watched schema/**, that bump would have landed silently and then
+# failed the next unrelated schema PR, blaming the wrong change. So the manifests
+# that pin the formatters are watched too.
+on:
+  pull_request:
+    paths:
+      - 'schema/**'
+      - '.github/workflows/schema-repro-check.yml'
+      # Formatter-defining manifests: a bump here changes generated output just as
+      # surely as an emitter bump does, so it must be caught in the PR that causes it.
+      - 'runtime/typescript/package.json'      # prettier / eslint range
+      - 'runtime/typescript/package-lock.json' # prettier / eslint resolved versions
+      - 'runtime/python/prompty/pyproject.toml' # ruff version + [tool.ruff] config
+      - 'runtime/python/prompty/uv.lock'
+      - '.editorconfig'                        # consumed by dotnet format
+
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regenerate-is-idempotent:
+    name: regeneration produces no diff
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      # runtime/python/prompty/uv.lock is tracked and the Python emitter shells out
+      # to `uv run ruff`, which may otherwise re-lock and dirty the tree — which
+      # would report here as generated-code staleness. Frozen turns that into an
+      # explicit lockfile error instead of a misattributed diff.
+      UV_FROZEN: '1'
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      # Generation is only reproducible when EVERY formatter the emitter shells out
+      # to is present. Each one degrades to a console warning when missing rather
+      # than failing, and the resulting unformatted output is indistinguishable in a
+      # diff from stale generated code. Measured on this repo at emitter 0.8.7:
+      # regenerating with prettier, uv, dotnet and Go hidden from PATH produced
+      # 1121 changed files / 47434 insertions, versus 5 files for the genuine drift.
+      # A previous version of this gate was misread exactly that way.
+      #
+      # @typra/emitter 0.8.7 invokes, per emit target in schema/tspconfig.yaml:
+      #   rustfmt   schema's `generate` script ends in `npm run format:rust`
+      #             (`cargo fmt --all`); the Rust driver's own `cargo fmt` is a
+      #             no-op here because it looks for src/Cargo.toml. Unlike the
+      #             others this one is a HARD failure — a failing npm script exits
+      #             non-zero — so it needs no warning grep.
+      #   prettier  typescript/driver.js walks up from the TypeScript project root
+      #             for node_modules/prettier/bin/prettier.cjs, then `npx eslint --fix`
+      #   ruff      python/driver.js runs `uv run ruff check --fix` and `uv run ruff format`
+      #   dotnet    csharp/driver.js runs `dotnet format <csproj>`
+      #   gofmt     go/driver.js runs `gofmt -w` (and `goimports -w` if present)
+      - name: Install Rust toolchain (provides rustfmt)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Set up Go (provides gofmt)
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: runtime/go/prompty/go.mod
+          cache: false
+
+      - name: Set up .NET (provides dotnet format)
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Install TypeScript workspace (provides prettier and eslint)
+        working-directory: runtime/typescript
+        run: npm ci
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+
+      - name: Install Python dev tooling (provides ruff)
+        working-directory: runtime/python/prompty
+        run: |
+          uv venv
+          uv pip install -e ".[dev]"
+
+      - name: Install schema dependencies
+        working-directory: schema
+        run: npm ci
+
+      - name: Regenerate from the pinned emitter
+        working-directory: schema
+        shell: bash
+        run: |
+          set -o pipefail
+          # The log goes to RUNNER_TEMP, never anywhere under the repo: a log file
+          # inside schema/ would itself show up in `git status --porcelain` below
+          # and fail the very assertion it exists to explain.
+          npm run generate 2>&1 | tee "$RUNNER_TEMP/generate.log"
+
+          # A missing formatter produces a warning and unformatted output, which is
+          # indistinguishable from stale generated code in the diff step below. Fail
+          # here, with the real cause, rather than reporting false staleness.
+          # These strings were verified by running 0.8.7 with the formatters removed.
+          if grep -Eq 'Warning: (prettier|ruff|gofmt|goimports|dotnet format|cargo fmt|Could not find)' "$RUNNER_TEMP/generate.log"; then
+            echo "::error::A formatter was unavailable during generation, so the output is not comparable to the committed tree."
+            echo "This is an environment problem in this job, not stale generated code."
+            echo "Do not 'fix' it by regenerating and committing — that would commit unformatted output."
+            echo ""
+            echo "--- formatter warnings ---"
+            grep -E 'Warning: ' "$RUNNER_TEMP/generate.log" || true
+            exit 1
+          fi
+
+      - name: Assert the tree is unchanged
+        shell: bash
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::Regenerating changed the tree: the committed generated code does not match the pinned emitter and formatters."
+            echo "Fix: run 'npm run generate' in schema/ and commit the result."
+            echo "(The step above already proved every formatter was present, so this is real drift, not a missing formatter.)"
+            echo ""
+            echo "--- changed files ---"
+            git status --porcelain
+            echo ""
+            echo "--- diff ---"
+            git --no-pager diff --stat
+            exit 1
+          fi
+          echo "Generated code matches the pinned emitter exactly."
